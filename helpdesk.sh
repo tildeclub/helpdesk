@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC2086,SC2155
 
 DB_PATH="/home/help/helpdesk.db"
 
@@ -24,6 +23,7 @@ TR_BIN="/usr/bin/tr"
 XARGS_BIN="$(command -v xargs || true)"
 MKTEMP_BIN="$(command -v mktemp || true)"
 STAT_BIN="$(command -v stat || true)"
+PYTHON_BIN="$(command -v python3 || true)"
 
 HELP_FROM_ADDR="root@tilde.club"
 HELP_FROM_NAME="tilde.club Help Desk"
@@ -294,6 +294,130 @@ rename_user_and_home() {
   return 0
 }
 
+append_authorized_key_secure() {
+  local username="$1"
+  local new_key="$2"
+
+  [[ -n "$username" ]] || { echo "Error: missing username." >&2; return 1; }
+  [[ -n "$new_key" ]] || { echo "Error: missing SSH key." >&2; return 1; }
+  [[ -n "$PYTHON_BIN" && -x "$PYTHON_BIN" ]] || { echo "Error: python3 not found; cannot safely write authorized_keys." >&2; return 1; }
+
+  new_key="${new_key//$'\r'/}"
+
+  printf '%s\n' "$new_key" | sudo "$PYTHON_BIN" - "$username" <<'PY'
+import os
+import pwd
+import stat
+import sys
+
+user = sys.argv[1]
+
+try:
+    pw = pwd.getpwnam(user)
+except KeyError:
+    print(f"Error: system user '{user}' does not exist.", file=sys.stderr)
+    raise SystemExit(1)
+
+uid, gid, home = pw.pw_uid, pw.pw_gid, pw.pw_dir
+
+key_in = sys.stdin.read()
+# Use only the first non-empty line (avoids accidental multi-line paste)
+lines = [ln.strip() for ln in key_in.splitlines() if ln.strip()]
+if not lines:
+    print("Error: empty SSH key.", file=sys.stderr)
+    raise SystemExit(1)
+key = lines[0]
+if "\x00" in key:
+    print("Error: invalid SSH key (NUL byte).", file=sys.stderr)
+    raise SystemExit(1)
+
+O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+
+def ensure_dir_at(parent_fd, name: str, mode: int):
+    """
+    Ensure name exists as a directory under parent_fd, not a symlink.
+    Use openat + O_NOFOLLOW to avoid symlink races.
+    """
+    try:
+        fd = os.open(name, os.O_RDONLY | O_DIRECTORY | O_NOFOLLOW, dir_fd=parent_fd)
+    except FileNotFoundError:
+        os.mkdir(name, mode=mode, dir_fd=parent_fd)
+        fd = os.open(name, os.O_RDONLY | O_DIRECTORY | O_NOFOLLOW, dir_fd=parent_fd)
+    except OSError as e:
+        print(f"Error: cannot open '{name}' as a directory (symlink or invalid): {e}", file=sys.stderr)
+        raise SystemExit(1)
+
+    st = os.fstat(fd)
+    if not stat.S_ISDIR(st.st_mode):
+        os.close(fd)
+        print(f"Error: '{name}' exists but is not a directory.", file=sys.stderr)
+        raise SystemExit(1)
+
+    # Enforce ownership and perms (best effort; this is running as root via sudo)
+    try:
+        os.fchown(fd, uid, gid)
+    except PermissionError:
+        pass
+    try:
+        os.fchmod(fd, mode)
+    except PermissionError:
+        pass
+
+    return fd
+
+# Open home directory safely
+try:
+    home_fd = os.open(home, os.O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+except OSError as e:
+    print(f"Error: cannot open home directory '{home}': {e}", file=sys.stderr)
+    raise SystemExit(1)
+
+ssh_fd = ensure_dir_at(home_fd, ".ssh", 0o700)
+
+# Open authorized_keys using openat with O_NOFOLLOW so symlinks are refused at open time.
+flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | O_NOFOLLOW
+try:
+    ak_fd = os.open("authorized_keys", flags, 0o600, dir_fd=ssh_fd)
+except IsADirectoryError:
+    print("Error: authorized_keys is a directory.", file=sys.stderr)
+    raise SystemExit(1)
+except OSError as e:
+    print(f"Error: cannot open authorized_keys (symlink or invalid): {e}", file=sys.stderr)
+    raise SystemExit(1)
+
+st = os.fstat(ak_fd)
+if not stat.S_ISREG(st.st_mode):
+    os.close(ak_fd)
+    print("Error: authorized_keys is not a regular file.", file=sys.stderr)
+    raise SystemExit(1)
+
+# Optional hardening: refuse weird link counts
+if getattr(st, "st_nlink", 1) != 1:
+    os.close(ak_fd)
+    print("Error: authorized_keys has unexpected link count; refusing.", file=sys.stderr)
+    raise SystemExit(1)
+
+# Enforce ownership and perms
+try:
+    os.fchown(ak_fd, uid, gid)
+except PermissionError:
+    pass
+try:
+    os.fchmod(ak_fd, 0o600)
+except PermissionError:
+    pass
+
+# Append with a trailing newline
+data = (key + "\n").encode("utf-8", "strict")
+os.write(ak_fd, data)
+
+os.close(ak_fd)
+os.close(ssh_fd)
+os.close(home_fd)
+PY
+}
+
 main_menu() {
   echo "Greetings, and welcome to the tilde.club help desk!"
   echo ""
@@ -411,10 +535,11 @@ redeem_key() {
   echo "Paste your new public SSH key (e.g., 'ssh-ed25519 AAAA...'):"
   read -r -t 120 new_key || { echo; echo "No input received for 2 minutes. Exiting..."; exit 1; }
 
-  sudo /bin/mkdir -p "/home/$username/.ssh" >/dev/null 2>&1
-  sudo /bin/chmod 700 "/home/$username/.ssh" >/dev/null 2>&1
-  printf '%s\n' "$new_key" | sudo /usr/bin/tee -a "/home/$username/.ssh/authorized_keys" >/dev/null
-  sudo /bin/chmod 600 "/home/$username/.ssh/authorized_keys" >/dev/null 2>&1
+  if ! append_authorized_key_secure "$username" "$new_key"; then
+    echo ""
+    echo "Error: could not add SSH key safely. Please contact an admin."
+    exit 1
+  fi
 
   db_exec "DELETE FROM requests WHERE code='$(sql_escape "$auth_code")';"
 
