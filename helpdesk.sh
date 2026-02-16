@@ -321,7 +321,6 @@ except KeyError:
 uid, gid, home = pw.pw_uid, pw.pw_gid, pw.pw_dir
 
 key_in = sys.stdin.read()
-# Use only the first non-empty line (avoids accidental multi-line paste)
 lines = [ln.strip() for ln in key_in.splitlines() if ln.strip()]
 if not lines:
     print("Error: empty SSH key.", file=sys.stderr)
@@ -331,8 +330,8 @@ if "\x00" in key:
     print("Error: invalid SSH key (NUL byte).", file=sys.stderr)
     raise SystemExit(1)
 
-O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
-O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+O_NOFOLLOW = os.O_NOFOLLOW
+O_DIRECTORY = os.O_DIRECTORY
 
 def ensure_dir_at(parent_fd, name: str, mode: int):
     """
@@ -354,7 +353,6 @@ def ensure_dir_at(parent_fd, name: str, mode: int):
         print(f"Error: '{name}' exists but is not a directory.", file=sys.stderr)
         raise SystemExit(1)
 
-    # Enforce ownership and perms (best effort; this is running as root via sudo)
     try:
         os.fchown(fd, uid, gid)
     except PermissionError:
@@ -366,7 +364,6 @@ def ensure_dir_at(parent_fd, name: str, mode: int):
 
     return fd
 
-# Open home directory safely
 try:
     home_fd = os.open(home, os.O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
 except OSError as e:
@@ -375,7 +372,6 @@ except OSError as e:
 
 ssh_fd = ensure_dir_at(home_fd, ".ssh", 0o700)
 
-# Open authorized_keys using openat with O_NOFOLLOW so symlinks are refused at open time.
 flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | O_NOFOLLOW
 try:
     ak_fd = os.open("authorized_keys", flags, 0o600, dir_fd=ssh_fd)
@@ -392,13 +388,11 @@ if not stat.S_ISREG(st.st_mode):
     print("Error: authorized_keys is not a regular file.", file=sys.stderr)
     raise SystemExit(1)
 
-# Optional hardening: refuse weird link counts
 if getattr(st, "st_nlink", 1) != 1:
     os.close(ak_fd)
     print("Error: authorized_keys has unexpected link count; refusing.", file=sys.stderr)
     raise SystemExit(1)
 
-# Enforce ownership and perms
 try:
     os.fchown(ak_fd, uid, gid)
 except PermissionError:
@@ -408,7 +402,6 @@ try:
 except PermissionError:
     pass
 
-# Append with a trailing newline
 data = (key + "\n").encode("utf-8", "strict")
 os.write(ak_fd, data)
 
