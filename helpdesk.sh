@@ -304,7 +304,8 @@ append_authorized_key_secure() {
 
   new_key="${new_key//$'\r'/}"
 
-  printf '%s\n' "$new_key" | sudo "$PYTHON_BIN" - "$username" <<'PY'
+  local py_code
+  py_code="$(cat <<'PY'
 import os
 import pwd
 import stat
@@ -325,6 +326,7 @@ lines = [ln.strip() for ln in key_in.splitlines() if ln.strip()]
 if not lines:
     print("Error: empty SSH key.", file=sys.stderr)
     raise SystemExit(1)
+
 key = lines[0]
 if "\x00" in key:
     print("Error: invalid SSH key (NUL byte).", file=sys.stderr)
@@ -334,10 +336,6 @@ O_NOFOLLOW = os.O_NOFOLLOW
 O_DIRECTORY = os.O_DIRECTORY
 
 def ensure_dir_at(parent_fd, name: str, mode: int):
-    """
-    Ensure name exists as a directory under parent_fd, not a symlink.
-    Use openat + O_NOFOLLOW to avoid symlink races.
-    """
     try:
         fd = os.open(name, os.O_RDONLY | O_DIRECTORY | O_NOFOLLOW, dir_fd=parent_fd)
     except FileNotFoundError:
@@ -409,6 +407,9 @@ os.close(ak_fd)
 os.close(ssh_fd)
 os.close(home_fd)
 PY
+)"
+
+  printf '%s\n' "$new_key" | sudo "$PYTHON_BIN" -c "$py_code" "$username"
 }
 
 main_menu() {
